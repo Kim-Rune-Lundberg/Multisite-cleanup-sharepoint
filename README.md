@@ -8,4 +8,8 @@ The script called "Versioning cleanup office revised" is designed to remove file
 Scripts can be adjusted to your specific needs. 
 I recommend downloading the scripts and modifying them to your needs. As the scripts are designed to be as generic as possible. 
 
+NB!NB!NB! 
+Be aware that with the persistent login on the scripts. This requires you to monitor the running of the script in case something goes wrong.
+The persistent authentication on the sites will follow token time to live so be aware of that! 
+
 Any questions regarding the scripts, send me a message and i'll answer :) 
