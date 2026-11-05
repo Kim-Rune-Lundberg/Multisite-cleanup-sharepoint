@@ -1,0 +1,492 @@
+
+#requires -Version 7.4
+
+<#
+.SYNOPSIS
+    Removes historical versions of selected file types from a SharePoint
+    Online document library.
+
+.DESCRIPTION
+    With $KeepTotal set to 10, the script retains only the current version of
+    each matching file and removes every historical version.
+    Get-PnPFileVersion returns historical versions only and does not include
+    the current version.
+
+
+.WARNING
+    This script is currently configured for a LIVE RUN:
+
+        $ApplyChanges = $false
+
+    Review the configuration carefully before execution.
+
+
+.REQUIREMENTS
+    - PowerShell 7.4 or later
+    - PnP.PowerShell
+    - A configured Microsoft Entra ID application/client ID
+    - Appropriate SharePoint permissions
+#>
+
+# ===========================================================================
+# Configuration
+# ===========================================================================
+
+$SiteUrl     = "https://name.sharepoint.com/sites/sitename"
+$LibraryName = "Document library name"
+$ClientId    = "0000000-0000-0000-0000-16663a887e98"
+
+$FileExtensions = @(
+    # Microsoft Word
+    ".doc"
+    ".docx"
+    ".docm"
+    ".dot"
+    ".dotx"
+    ".dotm"
+
+
+    # Microsoft Excel
+    ".xls"
+    ".xlsx"
+    ".xlsm"
+    ".xlsb"
+    ".xlt"
+    ".xltx"
+    ".xltm"
+    ".xla"
+    ".xlam"
+
+
+    # Microsoft PowerPoint
+    ".ppt"
+    ".pptx"
+    ".pptm"
+    ".pot"
+    ".potx"
+    ".potm"
+    ".pps"
+    ".ppsx"
+    ".ppsm"
+    ".ppa"
+    ".ppam"
+    ".sldx"
+    ".sldm"
+    ".thmx"
+
+
+    # Microsoft Visio
+    ".vsd"
+    ".vsdx"
+    ".vsdm"
+    ".vss"
+    ".vssx"
+    ".vssm"
+    ".vst"
+    ".vstx"
+    ".vstm"
+
+
+    # Microsoft Project
+    ".mpp"
+    ".mpt"
+
+
+    # Microsoft Access
+    ".mdb"
+    ".accdb"
+    ".accde"
+    ".accdr"
+    ".accdt"
+
+
+    # Microsoft Publisher
+    ".pub"
+
+
+    # Microsoft OneNote
+    ".one"
+
+
+    # Microsoft Outlook and email
+    ".msg"
+    ".eml"
+    ".oft"
+)
+
+# Total versions retained, including the current version.
+# 10 means retain the current version plus 9 newest historical versions.
+$KeepTotal = 10
+
+# $false = dry run
+# $true  = live removal
+$ApplyChanges = $true
+
+# ===========================================================================
+# Configuration validation
+# ===========================================================================
+
+if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
+    throw '$SiteUrl cannot be empty.'
+}
+
+if (-not [System.Uri]::IsWellFormedUriString(
+        $SiteUrl,
+        [System.UriKind]::Absolute
+    )) {
+    throw "'$SiteUrl' is not a valid absolute URL."
+}
+
+if ([string]::IsNullOrWhiteSpace($LibraryName)) {
+    throw '$LibraryName cannot be empty.'
+}
+
+if ([string]::IsNullOrWhiteSpace($ClientId)) {
+    throw '$ClientId cannot be empty.'
+}
+
+$ParsedClientId = [guid]::Empty
+
+if (-not [guid]::TryParse($ClientId, [ref]$ParsedClientId)) {
+    throw "'$ClientId' is not a valid GUID."
+}
+
+if ($KeepTotal -lt 1) {
+    throw '$KeepTotal must be at least 1 because the current version is always retained.'
+}
+
+if (-not $FileExtensions -or $FileExtensions.Count -eq 0) {
+    throw '$FileExtensions must contain at least one file extension.'
+}
+
+# ===========================================================================
+# Locate and import PnP.PowerShell
+# ===========================================================================
+
+$InstalledPnPModule = Get-Module -ListAvailable -Name "PnP.PowerShell" |
+    Sort-Object -Property Version -Descending |
+    Select-Object -First 1
+
+if ($null -eq $InstalledPnPModule) {
+    throw @"
+PnP.PowerShell is not installed.
+
+Open PowerShell 7 and run:
+
+Install-Module PnP.PowerShell -Scope CurrentUser
+"@
+}
+
+$ImportModuleParameters = @{
+    Name            = "PnP.PowerShell"
+    RequiredVersion = $InstalledPnPModule.Version
+    ErrorAction     = "Stop"
+}
+
+Import-Module @ImportModuleParameters
+
+$LoadedPnPModule = Get-Module -Name "PnP.PowerShell" |
+    Sort-Object -Property Version -Descending |
+    Select-Object -First 1
+
+if ($null -eq $LoadedPnPModule) {
+    throw 'PnP.PowerShell was found but could not be confirmed as loaded.'
+}
+
+Write-Host (
+    "Using PnP.PowerShell {0} from {1}" -f
+    $LoadedPnPModule.Version,
+    $LoadedPnPModule.Path
+) -ForegroundColor DarkGray
+
+# ===========================================================================
+# Normalize extension list
+# ===========================================================================
+
+$FileExtensions = @(
+    $FileExtensions |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_)
+        } |
+        ForEach-Object {
+            $Extension = ([string]$_).Trim().ToLowerInvariant()
+
+            if (-not $Extension.StartsWith('.')) {
+                $Extension = ".$Extension"
+            }
+
+            $Extension
+        } |
+        Sort-Object -Unique
+)
+
+# Get-PnPFileVersion excludes the current version.
+$KeepPrevious = $KeepTotal - 1
+
+# ===========================================================================
+# Counters and state
+# ===========================================================================
+
+$ProcessedFiles    = 0
+$SkippedFiles      = 0
+$CandidateVersions = 0
+$RemovedVersions   = 0
+$FailedVersions    = 0
+$FailedFiles       = 0
+$Connected         = $false
+$Connection        = $null
+
+# ===========================================================================
+# Main processing
+# ===========================================================================
+
+try {
+    $ConnectParameters = @{
+        Url         = $SiteUrl
+        Interactive = $true
+        ClientId    = $ClientId
+        ErrorAction = "Stop"
+    }
+
+    Connect-PnPOnline @ConnectParameters
+
+    $Connected  = $true
+    $Connection = Get-PnPConnection -ErrorAction Stop
+
+    if ($null -eq $Connection) {
+        throw 'Get-PnPConnection did not return a connection object.'
+    }
+
+    Write-Host ""
+    Write-Host "SharePoint version cleanup" -ForegroundColor Green
+    Write-Host "--------------------------"
+    Write-Host "Site                    : $SiteUrl"
+    Write-Host "Library                 : $LibraryName"
+    Write-Host "PnP.PowerShell version  : $($LoadedPnPModule.Version)"
+    Write-Host "Total versions retained : $KeepTotal"
+    Write-Host "Historical versions kept: $KeepPrevious"
+    Write-Host "Apply changes           : $ApplyChanges"
+    Write-Host "Extension count         : $($FileExtensions.Count)"
+    Write-Host ""
+
+    if ($ApplyChanges) {
+        Write-Warning (
+            "LIVE RUN ENABLED: Historical versions outside the newest {0} total version(s) will be removed." -f
+            $KeepTotal
+        )
+    }
+    else {
+        Write-Host "DRY RUN: No versions will be removed." -ForegroundColor Cyan
+    }
+
+    Write-Host ""
+
+    $ListItemParameters = @{
+        List        = $LibraryName
+        PageSize    = 500
+        Fields      = @(
+            "FileLeafRef"
+            "FileRef"
+            "FSObjType"
+        )
+        Connection  = $Connection
+        ErrorAction = "Stop"
+    }
+
+    Get-PnPListItem @ListItemParameters |
+        ForEach-Object {
+            $Item = $_
+
+            # FSObjType: 0 = file, 1 = folder.
+            if ([int]$Item.FieldValues["FSObjType"] -ne 0) {
+                return
+            }
+
+            $FileName = [string]$Item.FieldValues["FileLeafRef"]
+
+            if ([string]::IsNullOrWhiteSpace($FileName)) {
+                $SkippedFiles++
+                return
+            }
+
+            $Extension = [System.IO.Path]::GetExtension($FileName)
+
+            if ([string]::IsNullOrWhiteSpace($Extension)) {
+                $SkippedFiles++
+                return
+            }
+
+            $Extension = $Extension.ToLowerInvariant()
+
+            if ($Extension -notin $FileExtensions) {
+                $SkippedFiles++
+                return
+            }
+
+            $FileUrl = [string]$Item.FieldValues["FileRef"]
+
+            if ([string]::IsNullOrWhiteSpace($FileUrl)) {
+                Write-Warning "Skipping '$FileName' because FileRef is empty."
+                $SkippedFiles++
+                return
+            }
+
+            $ProcessedFiles++
+
+            try {
+                $GetVersionParameters = @{
+                    Url         = $FileUrl
+                    Connection  = $Connection
+                    ErrorAction = "Stop"
+                }
+
+                $Versions = @(
+                    Get-PnPFileVersion @GetVersionParameters |
+                        Sort-Object -Property Created -Descending
+                )
+
+                $TotalVersionCount = $Versions.Count + 1
+
+                if ($Versions.Count -le $KeepPrevious) {
+                    Write-Host (
+                        "KEEP: {0} ({1} total version(s))" -f
+                        $FileUrl,
+                        $TotalVersionCount
+                    ) -ForegroundColor DarkGreen
+
+                    return
+                }
+
+                # Historical versions are sorted newest to oldest.
+                # Keep the newest $KeepPrevious historical versions.
+                $VersionsToRemove = @(
+                    $Versions |
+                        Select-Object -Skip $KeepPrevious
+                )
+
+                foreach ($Version in $VersionsToRemove) {
+                    $CandidateVersions++
+
+                    if ($null -eq $Version) {
+                        $FailedVersions++
+                        Write-Warning "A null version object was returned for '$FileUrl'."
+                        continue
+                    }
+
+                    $VersionLabel = [string]$Version.VersionLabel
+                    $VersionId    = [string]$Version.Id
+                    $VersionDate  = $Version.Created
+
+                    if ([string]::IsNullOrWhiteSpace($VersionId)) {
+                        $FailedVersions++
+
+                        Write-Warning (
+                            "Skipping version '{0}' of '{1}' because its version ID is empty." -f
+                            $VersionLabel,
+                            $FileUrl
+                        )
+
+                        continue
+                    }
+
+                    if (-not $ApplyChanges) {
+                        Write-Host (
+                            "DRY RUN: Would remove {0} | version {1} | ID {2} | created {3}" -f
+                            $FileUrl,
+                            $VersionLabel,
+                            $VersionId,
+                            $VersionDate
+                        ) -ForegroundColor Cyan
+
+                        continue
+                    }
+
+                    try {
+                        $RemoveVersionParameters = @{
+                            Url         = $FileUrl
+                            Identity    = $Version.Id
+                            Recycle     = $true
+                            Force       = $true
+                            Connection  = $Connection
+                            ErrorAction = "Stop"
+                        }
+
+                        Remove-PnPFileVersion @RemoveVersionParameters
+                        $RemovedVersions++
+
+                        Write-Host (
+                            "REMOVED: {0} | version {1} | ID {2} | created {3}" -f
+                            $FileUrl,
+                            $VersionLabel,
+                            $VersionId,
+                            $VersionDate
+                        ) -ForegroundColor Yellow
+                    }
+                    catch {
+                        $FailedVersions++
+
+                        Write-Warning (
+                            "Failed to remove version {0} (ID {1}) from '{2}': {3}" -f
+                            $VersionLabel,
+                            $VersionId,
+                            $FileUrl,
+                            $_.Exception.Message
+                        )
+
+                        Write-Host (
+                            "  Exception type: {0}" -f
+                            $_.Exception.GetType().FullName
+                        ) -ForegroundColor DarkRed
+
+                        Write-Host (
+                            "  FullyQualifiedErrorId: {0}" -f
+                            $_.FullyQualifiedErrorId
+                        ) -ForegroundColor DarkRed
+
+                        Write-Host (
+                            "  CategoryInfo: {0}" -f
+                            $_.CategoryInfo
+                        ) -ForegroundColor DarkRed
+                    }
+                }
+            }
+            catch {
+                $FailedFiles++
+
+                Write-Warning (
+                    "Failed to retrieve or process versions for '{0}': {1}" -f
+                    $FileUrl,
+                    $_.Exception.Message
+                )
+            }
+        }
+}
+catch {
+    throw "Script execution failed: $($_.Exception.Message)"
+}
+finally {
+    if ($Connected) {
+        Disconnect-PnPOnline -ErrorAction SilentlyContinue
+    }
+}
+
+# ===========================================================================
+# Summary
+# ===========================================================================
+
+Write-Host ""
+Write-Host "Processing summary" -ForegroundColor Green
+Write-Host "------------------"
+Write-Host "Matching files processed : $ProcessedFiles"
+Write-Host "Nonmatching files skipped : $SkippedFiles"
+Write-Host "Versions identified       : $CandidateVersions"
+Write-Host "Versions removed          : $RemovedVersions"
+Write-Host "Version removal failures  : $FailedVersions"
+Write-Host "File processing failures  : $FailedFiles"
+Write-Host "Versions retained         : $KeepTotal total per matching file"
+Write-Host "Apply changes              : $ApplyChanges"
+
+if (-not $ApplyChanges) {
+    Write-Host ""
+    Write-Host "DRY RUN ONLY: No versions were removed." -ForegroundColor Cyan
+}
