@@ -32,16 +32,16 @@
 # =============================================================================
 
 $SiteUrls = @(
-    "https://atplan.sharepoint.com/sites/AT-854",
-    "https://atplan.sharepoint.com/sites/1111GjerdrumsveiSiO",
-    "https://atplan.sharepoint.com/sites/AT-749"
+    "https://name.sharepoint.com/sites/sitename",
+    "https://name.sharepoint.com/sites/sitename",
+    "https://name.sharepoint.com/sites/sitename"
 )
 
 # Assumes the same library exists on every site.
-$LibraryName = "Dokumenter"
+$LibraryName = "Document library name"
 
 # Entra ID application/client ID used for PnP interactive authentication.
-$ClientId = "8a040c4b-4a20-4164-8707-16663a887e98"
+$ClientId = "00000000-0000-0000-0000-000000000000" #Add in your Entra ID application/client ID here.
 
 
 # File extensions that will be processed.
