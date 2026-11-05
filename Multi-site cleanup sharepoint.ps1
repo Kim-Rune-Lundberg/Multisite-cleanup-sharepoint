@@ -20,7 +20,8 @@
 #
 # Sites are processed sequentially.
 # A failure on one site does not prevent remaining sites from being processed.
-# Reauthentication is performed for each site.
+# Interactive sign-in is cached for reuse across sites with the same tenant and
+# client ID; first sign-in or token expiry may still require authentication.
 #
 # Created by Kim Rune Lundberg. Copilot helped generate some of the code, 
 # but I reviewed and modified it to ensure it met my requirements. Script has also been tested and verified to work as intended.
@@ -277,6 +278,7 @@ foreach ($SiteUrl in $SiteUrls) {
             -Url $SiteUrl `
             -Interactive `
             -ClientId $ClientId `
+            -PersistLogin `
             -ReturnConnection `
             -ErrorAction Stop
 
